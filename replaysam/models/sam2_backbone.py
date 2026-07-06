@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import os
+from pathlib import Path
+import sys
 from typing import Iterator
 import logging
 
@@ -12,7 +14,17 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-import sam2
+try:
+    import sam2
+except ModuleNotFoundError as exc:
+    if exc.name != "sam2":
+        raise
+    vendored_models_dir = Path(__file__).resolve().parent
+    if not (vendored_models_dir / "sam2" / "__init__.py").exists():
+        raise
+    sys.path.insert(0, str(vendored_models_dir))
+    import sam2
+
 from sam2.build_sam import _load_checkpoint
 from sam2.modeling.sam2_base import NO_OBJ_SCORE
 from sam2.modeling.sam2_utils import get_1d_sine_pe, select_closest_cond_frames
@@ -1116,12 +1128,10 @@ class SAM2Backbone(SAM2VideoPredictor):
         if config.model_size in model_sizes:
             config.model_size = model_sizes[config.model_size]
 
-        module_dir = os.path.dirname(str(sam2.__file__))
-        config_dir = "/" + os.path.join(
-            module_dir, config_paths[config.model_size][0]
-        )
-        checkpt_dir = os.path.join(
-            module_dir, "../checkpoints", config_paths[config.model_size][1]
+        module_dir = Path(sam2.__file__).resolve().parent
+        config_dir = "/" + str(module_dir / config_paths[config.model_size][0])
+        checkpt_dir = str(
+            module_dir / "checkpoints" / config_paths[config.model_size][1]
         )
 
         hydra_overrides = [f"++model._target_={__name__}.SAM2Backbone"]
