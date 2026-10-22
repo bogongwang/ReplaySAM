@@ -9,8 +9,13 @@ ReplaySAM treats a tomogram as three orthogonal video sequences: XY, XZ, and YZ.
 ## Features
 
 - Automatic prompt generation from local maxima in a distance transform.
+- Triton blockwise-argmax prompt generation, with a CPU reference fallback.
 - SAM 2 inference replayed across orthogonal tomographic views.
 - Multi-axis mask fusion through majority voting.
+- Multiple positive and negative 3D prompts for guided inference.
+- Optional zoomed, multi-scale seed and propagation inference.
+- Axis-pair consistency filtering for rejecting contradictory views.
+- NumPy, PyTorch tensor, and Dask model data loaders.
 - Zarr, NumPy, TIFF, NIfTI, and NetCDF volume loading utilities.
 - Zarr output writer for instance segmentation volumes.
 - Demo notebook for the example iron ore tomogram.
@@ -143,6 +148,7 @@ config = SAM2PipelineConfig(
         compile=False,
     ),
     prompt_generator_config=PromptGeneratorConfig(
+        method="peak_local_max",  # or "blockwise_argmax" on CUDA
         binarisation_threshold=None,
         dist_val_thresh=5.0,
         max_filter_size=7,
@@ -158,6 +164,22 @@ pipeline = Pipeline(config)
 pipeline.run()
 print(pipeline.output_path)
 ```
+
+For guided segmentation, provide any number of positive points and optional
+negative points in `(z, y, x)` order:
+
+```python
+pipeline.run_with_prompt_points(
+    positive_point_prompts=[(42, 120, 180), (43, 122, 181)],
+    negative_point_prompts=[(42, 90, 160)],
+)
+```
+
+The model adapter also accepts a `dask.array.Array`, `torch.Tensor`, or
+`numpy.ndarray` directly. Set `volume_loader="dask"` in
+`SAM2PipelineConfig` to keep a file-backed volume lazy; set
+`backbone_config.zoom_enabled=True` to enable the configured multi-scale zoom
+path, and adjust `consistency_score` to control axis-agreement filtering.
 
 Outputs are written to a timestamped directory under `output_parent_dir`, with the segmentation stored as `segmentation.zarr`.
 

@@ -29,7 +29,7 @@ from sam2.build_sam import _load_checkpoint
 from sam2.modeling.sam2_base import NO_OBJ_SCORE
 from sam2.modeling.sam2_utils import get_1d_sine_pe, select_closest_cond_frames
 from sam2.sam2_video_predictor import SAM2VideoPredictor
-from sam2.utils.amg import batch_iterator
+from sam2.utils.amg import batch_iterator, generate_crop_boxes
 from sam2.utils.misc import fill_holes_in_mask_scores
 from replaysam.utils.configs import SAM2BackboneConfig
 from replaysam.utils.dataloader import SAM2DataLoader
@@ -90,14 +90,24 @@ class SAM2Backbone(SAM2VideoPredictor):
             Returns `(None, None)` when no valid object is found.
         """
         slice_idx = point_prompt[axis]
-        crop_boxes = [(0, 0, self.image_size, self.image_size)]
-        input_points = self._generate_input_points(
+        image_hw = dataloader.get_curr_hw(axis=axis)
+        crop_boxes, _ = generate_crop_boxes(
+            im_size=image_hw,
+            n_layers=self.config.n_crop_layers,
+            overlap_ratio=self.config.crop_layers_overlap_ratio,
+        )
+        full_image_points = self._generate_full_image_points(
             input_point=point_prompt,
-            tomo_size=self._dataloader_shape(dataloader),
-            crop_boxes=crop_boxes,
+            tomo_size=dataloader.get_crop_shape(),
             axis=axis,
             n_sample_points=self.config.n_sample_points,
-            sample_radius=rand_pts_radius
+            sample_radius=rand_pts_radius,
+            output_hw=image_hw,
+        )
+        input_points = self._translate_points(
+            points=full_image_points,
+            crop_boxes=crop_boxes,
+            image_hw=image_hw,
         )
         sam_results = self._predict_with_points(
             dataloader=dataloader,
@@ -105,6 +115,7 @@ class SAM2Backbone(SAM2VideoPredictor):
             axis=axis,
             point_prompts=input_points,
             crop_boxes=crop_boxes,
+            original_size=image_hw,
         )
         postprocessed_sam_result = self._postprocess_sam_results(
             sam_results=sam_results,
@@ -129,11 +140,264 @@ class SAM2Backbone(SAM2VideoPredictor):
 
     @staticmethod
     def _dataloader_shape(dataloader: SAM2DataLoader) -> tuple[int, int, int]:
-        return (
-            dataloader.get_num_slices(0),
-            dataloader.get_num_slices(1),
-            dataloader.get_num_slices(2),
+        """Return the active dataloader shape (kept for compatibility)."""
+        return dataloader.get_crop_shape()
+
+    @torch.inference_mode()
+    def segment_starting_slice_with_prompts(
+        self,
+        dataloader: SAM2DataLoader,
+        positive_point_prompts: list[tuple[int, int, int]],
+        negative_point_prompts: list[tuple[int, int, int]] | None = None,
+        axis: int = 0,
+    ) -> tuple[int, torch.Tensor] | tuple[None, None]:
+        """Segment the seed slice from explicit positive and negative points."""
+        if not positive_point_prompts:
+            raise ValueError("positive_point_prompts must contain at least one point.")
+        slice_idx = int(positive_point_prompts[0][axis])
+        image_hw = dataloader.get_curr_hw(axis=axis)
+        crop_boxes, _ = generate_crop_boxes(
+            im_size=image_hw,
+            n_layers=self.config.n_crop_layers,
+            overlap_ratio=self.config.crop_layers_overlap_ratio,
         )
+        full_image_points, point_labels = self._generate_full_image_prompt_set(
+            positive_point_prompts=positive_point_prompts,
+            negative_point_prompts=negative_point_prompts,
+            tomo_size=dataloader.get_crop_shape(),
+            axis=axis,
+            output_hw=image_hw,
+        )
+        input_points = self._translate_points(
+            points=full_image_points,
+            crop_boxes=crop_boxes,
+            image_hw=image_hw,
+        )
+        input_labels = [point_labels.copy() for _ in crop_boxes]
+        sam_results = self._predict_with_points(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            point_prompts=input_points,
+            crop_boxes=crop_boxes,
+            point_labels=input_labels,
+            original_size=image_hw,
+        )
+        postprocessed_sam_result = self._postprocess_sam_results(
+            sam_results=sam_results,
+            pred_iou_thresh=self.config.pred_iou_thresh,
+        )
+        if postprocessed_sam_result is None:
+            return None, None
+        self._save_seg_res_to_cache(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            sam_result=postprocessed_sam_result,
+        )
+        output_high_res_mask = resize_2d(
+            image=postprocessed_sam_result.high_res_masks,
+            size=image_hw,
+        ).squeeze()
+        del postprocessed_sam_result
+        torch.cuda.empty_cache()
+        return slice_idx, output_high_res_mask
+
+    @torch.inference_mode()
+    def segment_starting_slice_zoomed(
+        self,
+        dataloader: SAM2DataLoader,
+        point_prompt: tuple[int, int, int],
+        axis: int = 0,
+        rand_pts_radius: float | None = None,
+    ) -> tuple[int, torch.Tensor] | tuple[None, None]:
+        """Segment a seed slice and refine it in a prompt-centered multi-scale crop."""
+        slice_idx = int(point_prompt[axis])
+        image_hw = dataloader.get_curr_hw(axis=axis)
+        full_image_points = self._generate_full_image_points(
+            input_point=point_prompt,
+            tomo_size=dataloader.get_crop_shape(),
+            axis=axis,
+            n_sample_points=self.config.n_sample_points,
+            sample_radius=rand_pts_radius,
+            output_hw=image_hw,
+        )
+        coarse_crop_box = self._largest_prompt_centered_crop_box(
+            points=full_image_points,
+            image_hw=image_hw,
+        )
+        input_points = self._translate_points(
+            points=full_image_points,
+            crop_boxes=[coarse_crop_box],
+            clamp_to_crop=True,
+            image_hw=image_hw,
+        )
+        sam_results = self._predict_with_points(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            point_prompts=input_points,
+            crop_boxes=[coarse_crop_box],
+            original_size=image_hw,
+        )
+        coarse_result = self._postprocess_sam_results(
+            sam_results=sam_results,
+            pred_iou_thresh=self.config.pred_iou_thresh,
+        )
+        if coarse_result is None:
+            return None, None
+
+        zoom_crop_box = self._mask_to_zoomed_crop_box(
+            mask=coarse_result.high_res_masks,
+            padding=self.config.zoom_padding,
+            image_hw=image_hw,
+        )
+        LOGGER.info("Zoom crop for slice %s at axis %s: %s", slice_idx, axis, zoom_crop_box)
+        zoom_result = None
+        if zoom_crop_box is not None:
+            auto_points = self._translate_points(
+                points=full_image_points,
+                crop_boxes=[zoom_crop_box],
+                clamp_to_crop=True,
+                image_hw=image_hw,
+            )
+            zoom_sam_results = self._predict_with_points(
+                dataloader=dataloader,
+                slice_idx=slice_idx,
+                axis=axis,
+                point_prompts=auto_points,
+                crop_boxes=[zoom_crop_box],
+                original_size=image_hw,
+            )
+            zoom_result = self._postprocess_sam_results(
+                sam_results=zoom_sam_results,
+                pred_iou_thresh=self.config.pred_iou_thresh,
+            )
+
+        if zoom_result is None:
+            if not self.config.zoom_fallback_to_coarse:
+                return None, None
+            zoom_result = coarse_result
+            zoom_crop_box = coarse_crop_box
+
+        self._save_zoom_seg_res_to_cache(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            sam_result=zoom_result,
+            crop_box=zoom_crop_box,
+        )
+        output_high_res_mask = resize_2d(
+            image=zoom_result.high_res_masks,
+            size=image_hw,
+        ).squeeze()
+        del coarse_result, zoom_result
+        torch.cuda.empty_cache()
+        return slice_idx, output_high_res_mask
+
+    @torch.inference_mode()
+    def segment_starting_slice_zoomed_with_prompts(
+        self,
+        dataloader: SAM2DataLoader,
+        positive_point_prompts: list[tuple[int, int, int]],
+        negative_point_prompts: list[tuple[int, int, int]] | None = None,
+        axis: int = 0,
+    ) -> tuple[int, torch.Tensor] | tuple[None, None]:
+        """Segment explicit prompts, then refine the result in a zoom crop."""
+        if not positive_point_prompts:
+            raise ValueError("positive_point_prompts must contain at least one point.")
+        slice_idx = int(positive_point_prompts[0][axis])
+        image_hw = dataloader.get_curr_hw(axis=axis)
+        full_image_points, point_labels = self._generate_full_image_prompt_set(
+            positive_point_prompts=positive_point_prompts,
+            negative_point_prompts=negative_point_prompts,
+            tomo_size=dataloader.get_crop_shape(),
+            axis=axis,
+            output_hw=image_hw,
+        )
+        positive_full_image_points, _ = self._generate_full_image_prompt_set(
+            positive_point_prompts=positive_point_prompts,
+            negative_point_prompts=None,
+            tomo_size=dataloader.get_crop_shape(),
+            axis=axis,
+            output_hw=image_hw,
+        )
+        coarse_crop_box = self._largest_prompt_centered_crop_box(
+            points=positive_full_image_points,
+            image_hw=image_hw,
+        )
+        coarse_crop_boxes = self._generate_crop_boxes_within(coarse_crop_box)
+        input_points = self._translate_points(
+            points=full_image_points,
+            crop_boxes=coarse_crop_boxes,
+            clamp_to_crop=True,
+            image_hw=image_hw,
+        )
+        input_labels = [point_labels.copy() for _ in coarse_crop_boxes]
+        sam_results = self._predict_with_points(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            point_prompts=input_points,
+            crop_boxes=coarse_crop_boxes,
+            point_labels=input_labels,
+            original_size=image_hw,
+        )
+        coarse_result = self._postprocess_sam_results(
+            sam_results=sam_results,
+            pred_iou_thresh=self.config.pred_iou_thresh,
+        )
+        if coarse_result is None:
+            return None, None
+
+        zoom_crop_box = self._mask_to_zoomed_crop_box(
+            mask=coarse_result.high_res_masks,
+            padding=self.config.zoom_padding,
+            image_hw=image_hw,
+        )
+        LOGGER.info("Zoom crop for slice %s at axis %s: %s", slice_idx, axis, zoom_crop_box)
+        zoom_result = None
+        if zoom_crop_box is not None:
+            auto_points = self._translate_points(
+                points=full_image_points,
+                crop_boxes=[zoom_crop_box],
+                clamp_to_crop=True,
+                image_hw=image_hw,
+            )
+            zoom_sam_results = self._predict_with_points(
+                dataloader=dataloader,
+                slice_idx=slice_idx,
+                axis=axis,
+                point_prompts=auto_points,
+                crop_boxes=[zoom_crop_box],
+                point_labels=[point_labels.copy()],
+                original_size=image_hw,
+            )
+            zoom_result = self._postprocess_sam_results(
+                sam_results=zoom_sam_results,
+                pred_iou_thresh=self.config.pred_iou_thresh,
+            )
+
+        if zoom_result is None:
+            if not self.config.zoom_fallback_to_coarse:
+                return None, None
+            zoom_result = coarse_result
+            zoom_crop_box = coarse_crop_box
+
+        self._save_zoom_seg_res_to_cache(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            sam_result=zoom_result,
+            crop_box=zoom_crop_box,
+        )
+        output_high_res_mask = resize_2d(
+            image=zoom_result.high_res_masks,
+            size=image_hw,
+        ).squeeze()
+        del coarse_result, zoom_result
+        torch.cuda.empty_cache()
+        return slice_idx, output_high_res_mask
 
     @torch.inference_mode()
     def propagate_all(
@@ -148,6 +412,24 @@ class SAM2Backbone(SAM2VideoPredictor):
                 start_slice_idx=start_slice_idx,
                 axis=axis,
                 reverse=tracking_order
+            ):
+                yield slice_idx, output_mask
+        self.clear_propagation_cache()
+
+    @torch.inference_mode()
+    def propagate_all_zoomed(
+        self,
+        dataloader: SAM2DataLoader,
+        start_slice_idx: int,
+        axis: int,
+    ) -> Iterator[tuple[int, torch.Tensor]]:
+        """Propagate in both directions, updating a prompt-centered crop per slice."""
+        for tracking_order in (False, True):
+            for slice_idx, output_mask in self.propagate_zoomed(
+                dataloader=dataloader,
+                start_slice_idx=start_slice_idx,
+                axis=axis,
+                reverse=tracking_order,
             ):
                 yield slice_idx, output_mask
         self.clear_propagation_cache()
@@ -205,6 +487,54 @@ class SAM2Backbone(SAM2VideoPredictor):
                     tracking_result=tracking_result,
                 )
             # restore to original resolution
+            output_high_res_mask = resize_2d(
+                image=tracking_result.high_res_masks,
+                size=dataloader.get_curr_hw(axis=axis),
+            ).squeeze()
+            yield slice_idx, output_high_res_mask
+
+    @torch.inference_mode()
+    def propagate_zoomed(
+        self,
+        dataloader: SAM2DataLoader,
+        start_slice_idx: int,
+        axis: int,
+        reverse: bool = False,
+    ) -> Iterator[tuple[int, torch.Tensor]]:
+        """Propagate through a mask-following crop and restore full-slice masks."""
+        processing_range = tqdm(
+            self._prepare_processing_range(
+                num_slices=dataloader.get_num_slices(axis=axis),
+                start_frame_idx=start_slice_idx,
+                reverse=reverse,
+            ),
+            desc=f'{"Reverse" if reverse else "Forward"} Zoomed Propagation at axis {axis}',
+            leave=False,
+        )
+        for slice_idx in processing_range:
+            tracking_result = self._propagate_zoomed(
+                dataloader=dataloader,
+                axis=axis,
+                slice_idx=slice_idx,
+                reverse=reverse,
+            )
+            if tracking_result is None:
+                continue
+            termination_mask_size = self._get_zoomed_termination_mask_size(
+                tracking_result.crop_box
+            )
+            if self._check_tracking_finished(
+                tracking_result=tracking_result,
+                slice_idx=slice_idx,
+                reverse=reverse,
+                termination_iou=self.config.termination_iou,
+                termination_mask_size=termination_mask_size,
+            ):
+                return
+            self._save_zoom_track_res_to_cache(
+                slice_idx=slice_idx,
+                tracking_result=tracking_result,
+            )
             output_high_res_mask = resize_2d(
                 image=tracking_result.high_res_masks,
                 size=dataloader.get_curr_hw(axis=axis),
@@ -289,6 +619,86 @@ class SAM2Backbone(SAM2VideoPredictor):
                 maskmem_pos_enc=maskmem_pos_enc,
             )
 
+    def _propagate_zoomed(
+        self,
+        dataloader: SAM2DataLoader,
+        slice_idx: int,
+        axis: int,
+        reverse: bool = False,
+    ) -> TrackingResult | None:
+        """Predict one slice using the previous slice's zoom crop."""
+        if slice_idx in self.propagation_cache.cond_frame_outputs:
+            return None
+
+        prev_slice_idx = slice_idx - 1 if not reverse else slice_idx + 1
+        prev_output = self._get_cached_tracking_output(prev_slice_idx)
+        if prev_output is None:
+            raise ValueError("Previous slice not found in outputs")
+
+        image_hw = dataloader.get_curr_hw(axis=axis)
+        crop_box = self._mask_to_zoomed_crop_box(
+            mask=self._get_cached_high_res_mask(prev_output),
+            padding=self.config.zoom_padding,
+            image_hw=image_hw,
+        )
+        if crop_box is None:
+            return None
+
+        _, _, current_vision_feats, current_vision_pos_embeds, feat_sizes = self._get_image_feature(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            crop_box=crop_box,
+        )
+        pix_feat = self._prepare_memory_conditioned_features(
+            slice_idx=slice_idx,
+            num_slices=dataloader.get_num_slices(axis=axis),
+            current_vision_feats=current_vision_feats[-1:],
+            current_vision_pos_embeds=current_vision_pos_embeds[-1:],
+            feat_sizes=feat_sizes[-1:],
+            is_init_cond_frame=False,
+            track_in_reverse=reverse,
+        )
+        high_res_features = [
+            feature.permute(1, 2, 0).view(feature.size(1), feature.size(2), *size)
+            for feature, size in zip(current_vision_feats[:-1], feat_sizes[:-1], strict=True)
+        ]
+        sam_outputs = self._forward_sam_heads(
+            backbone_features=pix_feat,
+            point_inputs=None,
+            mask_inputs=None,
+            high_res_features=high_res_features,
+            multimask_output=False,
+        )
+        _, _, ious, low_res_masks, high_res_masks, obj_ptr, object_score_logits = sam_outputs
+        maskmem_features, maskmem_pos_enc = self._encode_memory_in_output(
+            current_vision_feats=current_vision_feats,
+            feat_sizes=feat_sizes,
+            point_inputs=None,
+            run_mem_encoder=True,
+            high_res_masks=high_res_masks,
+            object_score_logits=object_score_logits,
+        )
+        restored_high_res_masks = self._restore_crop_mask_to_full_image(
+            mask=high_res_masks,
+            crop_box=crop_box,
+            original_size=image_hw,
+        )
+        restored_low_res_masks = resize_2d(
+            image=restored_high_res_masks,
+            size=low_res_masks.shape[-2:],
+        )
+        return TrackingResult(
+            ious=ious,
+            low_res_masks=restored_low_res_masks,
+            high_res_masks=restored_high_res_masks,
+            obj_ptrs=obj_ptr,
+            obj_score_logits=object_score_logits,
+            maskmem_features=maskmem_features,
+            maskmem_pos_enc=maskmem_pos_enc,
+            crop_box=crop_box,
+        )
+
     def _check_tracking_finished(
             self,
             tracking_result: TrackingResult,
@@ -354,6 +764,23 @@ class SAM2Backbone(SAM2VideoPredictor):
             "pred_masks": tracking_result.low_res_masks,
             "obj_ptr": tracking_result.obj_ptrs,
             "object_score_logits": tracking_result.obj_score_logits,
+        }
+        self.propagation_cache.non_cond_frame_outputs.add(key=slice_idx, value=out)
+
+    def _save_zoom_track_res_to_cache(
+        self,
+        slice_idx: int,
+        tracking_result: TrackingResult,
+    ) -> None:
+        """Store zoomed propagation memory and its restored full-slice mask."""
+        out = {
+            "maskmem_features": tracking_result.maskmem_features,
+            "maskmem_pos_enc": tracking_result.maskmem_pos_enc,
+            "pred_masks": tracking_result.low_res_masks,
+            "pred_masks_high_res": tracking_result.high_res_masks,
+            "obj_ptr": tracking_result.obj_ptrs,
+            "object_score_logits": tracking_result.obj_score_logits,
+            "crop_box": tracking_result.crop_box,
         }
         self.propagation_cache.non_cond_frame_outputs.add(key=slice_idx, value=out)
 
@@ -715,7 +1142,7 @@ class SAM2Backbone(SAM2VideoPredictor):
         weighted_obj_ptr = torch.sum(iou_softmax[:, None] * sam_results.obj_ptrs, dim=0)
         weighted_obj_score_logit = torch.sum(iou_softmax[:, None] * sam_results.obj_score_logits, dim=0)
         # Remove extremely large predictions
-        mask_area_ratio = (weighted_low_res_mask > 0).sum() / 65336  # normalize by the total number of pixels in low-res mask (256x256)
+        mask_area_ratio = (weighted_low_res_mask > 0).float().mean()
         if mask_area_ratio > 0.5:
             LOGGER.warning(f"Ignoring segmentation result: Predicted mask area ratio {mask_area_ratio:.2f} is larger than 0.5, likely due to failed prompt sampling.")
             return None
@@ -748,7 +1175,10 @@ class SAM2Backbone(SAM2VideoPredictor):
             crop_box=None
         )
         # Move to compute device for encoding
-        high_res_mask = sam_result.high_res_masks[None, None].to(self.config.compute_device)
+        high_res_mask = resize_2d(
+            image=sam_result.high_res_masks,
+            size=(self.image_size, self.image_size),
+        ).squeeze()[None, None].to(self.config.compute_device)
         obj_score_logit = sam_result.obj_score_logits.to(self.config.compute_device)
         maskmem_features, maskmem_pos_enc = self._encode_new_memory(
             current_vision_feats=current_vision_feats,
@@ -757,7 +1187,8 @@ class SAM2Backbone(SAM2VideoPredictor):
             object_score_logits=obj_score_logit,
             is_mask_from_pts=True,
         )
-        maskmem_features = maskmem_features.to(torch.bfloat16)
+        if maskmem_features is not None:
+            maskmem_features = maskmem_features.to(torch.bfloat16)
 
         if maskmem_pos_enc is not None:
             batch_size = maskmem_pos_enc[0].size(0)
@@ -778,6 +1209,59 @@ class SAM2Backbone(SAM2VideoPredictor):
             "pred_masks": sam_result.low_res_masks.unsqueeze(0),
             "obj_ptr": sam_result.obj_ptrs.unsqueeze(0),
             "object_score_logits": sam_result.obj_score_logits.unsqueeze(0),
+        }
+
+    @torch.inference_mode()
+    def _save_zoom_seg_res_to_cache(
+        self,
+        dataloader: SAM2DataLoader,
+        slice_idx: int,
+        axis: int,
+        sam_result: SegmentationResult,
+        crop_box: tuple[int, int, int, int],
+    ) -> None:
+        """Encode a zoom-crop prompt result while retaining its full-slice mask."""
+        _, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
+            dataloader=dataloader,
+            slice_idx=slice_idx,
+            axis=axis,
+            crop_box=crop_box,
+        )
+        high_res_mask = self._crop_full_mask_for_memory(
+            mask=sam_result.high_res_masks,
+            crop_box=crop_box,
+        )[None, None].to(self.config.compute_device)
+        obj_score_logit = sam_result.obj_score_logits.to(self.config.compute_device)
+        maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+            current_vision_feats=current_vision_feats,
+            feat_sizes=feat_sizes,
+            pred_masks_high_res=high_res_mask,
+            object_score_logits=obj_score_logit,
+            is_mask_from_pts=True,
+        )
+        if maskmem_features is not None:
+            maskmem_features = maskmem_features.to(torch.bfloat16)
+
+        if maskmem_pos_enc is not None:
+            batch_size = maskmem_pos_enc[0].size(0)
+            if self.propagation_cache.maskmem_pos_enc is None:
+                self.propagation_cache.maskmem_pos_enc = [
+                    value[0:1].clone() for value in maskmem_pos_enc
+                ]
+            maskmem_pos_enc = self.propagation_cache.maskmem_pos_enc
+            expanded_maskmem_pos_enc = [
+                value.expand(batch_size, -1, -1, -1) for value in maskmem_pos_enc
+            ]
+        else:
+            expanded_maskmem_pos_enc = None
+        self.propagation_cache.cond_frame_outputs[slice_idx] = {
+            "maskmem_features": maskmem_features,
+            "maskmem_pos_enc": expanded_maskmem_pos_enc,
+            "pred_masks": sam_result.low_res_masks.unsqueeze(0),
+            "pred_masks_high_res": sam_result.high_res_masks.unsqueeze(0),
+            "obj_ptr": sam_result.obj_ptrs.unsqueeze(0),
+            "object_score_logits": sam_result.obj_score_logits.unsqueeze(0),
+            "crop_box": crop_box,
         }
 
     def _forward_sam_model(
@@ -903,7 +1387,7 @@ class SAM2Backbone(SAM2VideoPredictor):
             dataloader: SAM2DataLoader,
             slice_idx: int,
             axis: int,
-            crop_box: tuple[int] | None = None,
+            crop_box: tuple[int, int, int, int] | None = None,
             **kwargs
     ):
         """Load or compute backbone features for a slice and optional crop box.
@@ -916,9 +1400,10 @@ class SAM2Backbone(SAM2VideoPredictor):
             The expanded image tensor and prepared backbone features expected by SAM2.
         """
         if crop_box is None:
-            crop_box = (0, 0, self.image_size, self.image_size)
+            image_h, image_w = dataloader.get_curr_hw(axis=axis)
+            crop_box = (0, 0, int(image_w), int(image_h))
         else:
-            crop_box = tuple(crop_box)
+            crop_box = tuple(int(value) for value in crop_box)
         feature_map = self.image_feats_cache.get_cache(axis).get(slice_idx, None)
         image, backbone_out = None, None
         if feature_map is not None:
@@ -928,8 +1413,11 @@ class SAM2Backbone(SAM2VideoPredictor):
             device = self.config.compute_device
             x0, y0, x1, y1 = crop_box
             image = dataloader.get(axis, slice_idx)
-            if crop_box != (0, 0, self.image_size, self.image_size):
-                image = image[:, y0:y1, x0:x1]
+            image = image[:, y0:y1, x0:x1]
+            if image.shape[-2] == 0 or image.shape[-1] == 0:
+                raise ValueError(
+                    f"Crop box {crop_box} is outside the image shape {tuple(image.shape[-2:])}."
+                )
             image = image.to(device)
             image = resize_2d(
                 image=image,
@@ -972,7 +1460,8 @@ class SAM2Backbone(SAM2VideoPredictor):
             sample_radius: float | None = 5,
             output_hw: tuple[int, int] | None = None,
     ) -> np.ndarray:
-        assert axis in [0, 1, 2], "Axis must be one of 0, 1, or 2"
+        if axis not in (0, 1, 2):
+            raise ValueError(f"Axis must be one of 0, 1, or 2, got {axis}.")
         if output_hw is None:
             output_hw = (self.image_size, self.image_size)
 
@@ -997,8 +1486,52 @@ class SAM2Backbone(SAM2VideoPredictor):
             )
             input_points = np.vstack(([input_point_2d], sampled_points))
 
-        output_h, output_w = output_hw
-        return input_points / tomo_size_2d * (output_w, output_h)
+        output_h, output_w = (int(output_hw[0]), int(output_hw[1]))
+        input_points = input_points / np.maximum(np.asarray(tomo_size_2d) - 1, 1)
+        input_points *= (max(output_w - 1, 0), max(output_h - 1, 0))
+        input_points[:, 0] = np.clip(input_points[:, 0], 0, max(output_w - 1, 0))
+        input_points[:, 1] = np.clip(input_points[:, 1], 0, max(output_h - 1, 0))
+        return input_points
+
+    def _generate_full_image_prompt_set(
+        self,
+        positive_point_prompts: list[tuple[int, int, int]],
+        negative_point_prompts: list[tuple[int, int, int]] | None,
+        tomo_size: tuple[int, int, int],
+        axis: int = 0,
+        output_hw: tuple[int, int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project multiple 3D positive/negative prompts into one 2D prompt set."""
+        if axis not in (0, 1, 2):
+            raise ValueError(f"Axis must be one of 0, 1, or 2, got {axis}.")
+        if not positive_point_prompts:
+            raise ValueError("At least one positive point prompt is required.")
+        if output_hw is None:
+            output_hw = (self.image_size, self.image_size)
+        negative_point_prompts = negative_point_prompts or []
+        point_prompts = list(positive_point_prompts) + list(negative_point_prompts)
+        remaining_axes = [index for index in range(3) if index != axis]
+        points_2d = np.asarray(
+            [
+                (point[remaining_axes[1]], point[remaining_axes[0]])
+                for point in point_prompts
+            ],
+            dtype=float,
+        )
+        tomo_size_2d = np.asarray(
+            (tomo_size[remaining_axes[1]], tomo_size[remaining_axes[0]]),
+            dtype=float,
+        )
+        output_h, output_w = (int(output_hw[0]), int(output_hw[1]))
+        points_2d = points_2d / np.maximum(tomo_size_2d - 1, 1)
+        points_2d *= (max(output_w - 1, 0), max(output_h - 1, 0))
+        points_2d[:, 0] = np.clip(points_2d[:, 0], 0, max(output_w - 1, 0))
+        points_2d[:, 1] = np.clip(points_2d[:, 1], 0, max(output_h - 1, 0))
+        point_labels = np.asarray(
+            [1] * len(positive_point_prompts) + [0] * len(negative_point_prompts),
+            dtype=np.int32,
+        )
+        return points_2d, point_labels
 
     def _generate_input_points(
             self,
@@ -1064,11 +1597,13 @@ class SAM2Backbone(SAM2VideoPredictor):
         all_normalized_points = []
         for crop_box in crop_boxes:
             normalized_points = []
-            x0, y0, x1, y1 = crop_box
+            x0, y0, x1, y1 = (int(value) for value in crop_box)
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError(f"Crop box must have positive area, got {crop_box}.")
             for point in points:
                 x, y = point
-                clipped_x = np.clip(x, 0, image_w)
-                clipped_y = np.clip(y, 0, image_h)
+                clipped_x = np.clip(x, 0, max(image_w - 1, 0))
+                clipped_y = np.clip(y, 0, max(image_h - 1, 0))
                 norm_x = (clipped_x - x0) / (x1 - x0)
                 norm_y = (clipped_y - y0) / (y1 - y0)
                 if clamp_to_crop:
@@ -1080,6 +1615,171 @@ class SAM2Backbone(SAM2VideoPredictor):
                 ])
             all_normalized_points.append(np.asarray(normalized_points))
         return all_normalized_points
+
+    def _get_cached_tracking_output(self, slice_idx: int):
+        if slice_idx in self.propagation_cache.cond_frame_outputs:
+            return self.propagation_cache.cond_frame_outputs[slice_idx]
+        if slice_idx in self.propagation_cache.non_cond_frame_outputs:
+            return self.propagation_cache.non_cond_frame_outputs[slice_idx]
+        return None
+
+    def _get_cached_high_res_mask(self, cached_output: dict) -> torch.Tensor:
+        high_res_mask = cached_output.get("pred_masks_high_res")
+        if high_res_mask is not None:
+            return high_res_mask.squeeze()
+        return resize_2d(
+            image=cached_output["pred_masks"],
+            size=(self.image_size, self.image_size),
+        ).squeeze()
+
+    def _mask_to_zoomed_crop_box(
+        self,
+        mask: torch.Tensor,
+        padding: int,
+        image_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int] | None:
+        """Create a configured square crop around a non-empty mask."""
+        image_h, image_w = (int(image_hw[0]), int(image_hw[1]))
+        mask = mask.squeeze() > 0
+        nonzero = torch.nonzero(mask, as_tuple=False)
+        if nonzero.numel() == 0:
+            return None
+        y_min, x_min = nonzero.min(dim=0).values.tolist()
+        y_max, x_max = (nonzero.max(dim=0).values + 1).tolist()
+        required_size = max(int(x_max - x_min), int(y_max - y_min)) + 2 * max(0, int(padding))
+        crop_size = self._select_zoomed_crop_size(
+            required_size=required_size,
+            image_hw=(image_h, image_w),
+        )
+        return self._centered_square_crop_box(
+            center_x=(x_min + x_max) / 2,
+            center_y=(y_min + y_max) / 2,
+            crop_size=crop_size,
+            image_hw=(image_h, image_w),
+        )
+
+    def _select_zoomed_crop_size(self, required_size: int, image_hw: tuple[int, int]) -> int:
+        crop_sizes = sorted(
+            int(size)
+            for size in self.config.zoom_sizes
+            if int(size) > 0
+        )
+        if not crop_sizes:
+            raise ValueError("zoom_sizes must contain at least one positive crop size.")
+        minimum = max(1, int(self.config.zoom_min_crop_size))
+        target = max(int(required_size), minimum)
+        max_image_size = max(int(image_hw[0]), int(image_hw[1]))
+        for crop_size in crop_sizes:
+            if crop_size >= target:
+                return min(crop_size, max_image_size)
+        return min(max(crop_sizes[-1], minimum), max_image_size)
+
+    def _largest_prompt_centered_crop_box(
+        self,
+        points: np.ndarray,
+        image_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Return the largest configured crop that fits around the prompts."""
+        image_h, image_w = (int(image_hw[0]), int(image_hw[1]))
+        max_crop_size = min(image_h, image_w)
+        fitting_sizes = [
+            int(size)
+            for size in self.config.zoom_sizes
+            if 0 < int(size) <= max_crop_size
+        ]
+        crop_size = max(fitting_sizes, default=max_crop_size)
+        points = np.asarray(points, dtype=float).reshape(-1, 2)
+        mean_x, mean_y = points.mean(axis=0)
+        return self._centered_square_crop_box(
+            center_x=float(mean_x),
+            center_y=float(mean_y),
+            crop_size=crop_size,
+            image_hw=(image_h, image_w),
+        )
+
+    @staticmethod
+    def _centered_square_crop_box(
+        center_x: float,
+        center_y: float,
+        crop_size: int,
+        image_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        image_h, image_w = (int(image_hw[0]), int(image_hw[1]))
+        crop_w = min(max(1, int(crop_size)), image_w)
+        crop_h = min(max(1, int(crop_size)), image_h)
+        x0 = int(np.floor(center_x - crop_w / 2))
+        y0 = int(np.floor(center_y - crop_h / 2))
+        x0 = min(max(0, x0), image_w - crop_w)
+        y0 = min(max(0, y0), image_h - crop_h)
+        return x0, y0, x0 + crop_w, y0 + crop_h
+
+    def _generate_crop_boxes_within(
+        self,
+        crop_box: tuple[int, int, int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        x0, y0, x1, y1 = crop_box
+        local_boxes, _ = generate_crop_boxes(
+            im_size=(y1 - y0, x1 - x0),
+            n_layers=self.config.n_crop_layers,
+            overlap_ratio=self.config.crop_layers_overlap_ratio,
+        )
+        return [
+            (local_x0 + x0, local_y0 + y0, local_x1 + x0, local_y1 + y0)
+            for local_x0, local_y0, local_x1, local_y1 in local_boxes
+        ]
+
+    @staticmethod
+    def _full_image_crop_box(image_hw: tuple[int, int]) -> tuple[int, int, int, int]:
+        image_h, image_w = (int(image_hw[0]), int(image_hw[1]))
+        return 0, 0, image_w, image_h
+
+    def _get_zoomed_termination_mask_size(
+        self,
+        crop_box: tuple[int, int, int, int] | None,
+    ) -> int:
+        if crop_box is None:
+            return int(self.config.termination_mask_size)
+        x0, y0, x1, y1 = crop_box
+        crop_side = max(x1 - x0, y1 - y0)
+        thresholds = {
+            int(size): int(value)
+            for size, value in self.config.zoom_termination_mask_sizes.items()
+            if int(size) > 0
+        }
+        if not thresholds:
+            return int(self.config.termination_mask_size)
+        for size in sorted(thresholds):
+            if crop_side <= size:
+                return thresholds[size]
+        return thresholds[max(thresholds)]
+
+    def _restore_crop_mask_to_full_image(
+        self,
+        mask: torch.Tensor,
+        crop_box: tuple[int, int, int, int],
+        original_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        if original_size is None:
+            original_size = (self.image_size, self.image_size)
+        x0, y0, x1, y1 = crop_box
+        cropped_mask = resize_2d(image=mask, size=(y1 - y0, x1 - x0))
+        return pad_to_orig_size(
+            cropped_im=cropped_mask,
+            original_size=original_size,
+            crop_box=crop_box,
+        )
+
+    def _crop_full_mask_for_memory(
+        self,
+        mask: torch.Tensor,
+        crop_box: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        x0, y0, x1, y1 = crop_box
+        cropped_mask = mask[..., y0:y1, x0:x1]
+        return resize_2d(
+            image=cropped_mask,
+            size=(self.image_size, self.image_size),
+        ).squeeze()
 
 
     # --- Initialisation method --- #
