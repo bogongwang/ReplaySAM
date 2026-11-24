@@ -2,6 +2,8 @@
 
 Interactive particle segmentation by replaying 3D volumes as video across orthogonal views.
 
+**Paper:** [ReplaySAM: Zero-Shot 3D Particle-Pack Segmentation with SAM 2](https://arxiv.org/abs/2611.30016) (arXiv preprint, 2026).
+
 > **Early preview:** this repository is an early research preview. APIs, configuration defaults, installation steps, and example data layout may change as the project develops.
 
 ReplaySAM treats a tomogram as three orthogonal video sequences: XY, XZ, and YZ. It generates point prompts automatically from distance-transform peaks, runs SAM 2 on view-wise slices, and fuses the resulting masks with majority voting to produce a 3D particle instance mask. The goal is zero-shot 3D particle instance segmentation without task-specific model training, while still supporting interactive annotation workflows.
@@ -41,10 +43,11 @@ notebooks/
 
 ReplaySAM is developed for Python 3.12 and a CUDA-capable PyTorch environment. A GPU is strongly recommended for full SAM 2 inference. Some utility and notebook cells can run on CPU, but the complete pipeline expects SAM 2 checkpoints and a compatible GPU.
 
-Install the project dependencies with `uv`:
+Clone the repository and install the project dependencies with `uv`:
 
 ```bash
-cd /home/bg/Developer/ReplaySAM
+git clone https://github.com/bogongwang/ReplaySAM.git
+cd ReplaySAM
 uv sync
 ```
 
@@ -188,3 +191,19 @@ Outputs are written to a timestamped directory under `output_parent_dir`, with t
 - The default prompt generator may use CuPy when available and falls back to CPU if CuPy/CUDA is unavailable.
 - Full-volume prompt generation can be expensive for large tomograms; tune `crop_size`, `crop_overlap`, thresholds, and `max_prompts` for quick experiments.
 - SAM 2 checkpoint loading is controlled by `SAM2BackboneConfig.model_size`; short aliases `t`, `s`, `b+`, and `l` map to `tiny`, `small`, `base_plus`, and `large`.
+
+## Citation
+
+If you use ReplaySAM in your research, please cite:
+
+```bibtex
+@misc{wang2026replaysam,
+  title         = {{ReplaySAM}: Zero-Shot {3D} Particle-Pack Segmentation with {SAM 2}},
+  author        = {Wang, Bogong and Zhang, Yulai and Lösel, Philipp D. and Kingston, Andrew and Knackstedt, Mark},
+  year          = {2026},
+  eprint        = {2611.30016},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2611.30016}
+}
+```
